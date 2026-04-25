@@ -11,10 +11,12 @@ PROJECT_DIR = Path(__file__).resolve().parent
 GITHUB_API = "https://api.github.com"
 IGNORE_PATTERNS = [
     ".env",
+    "bot_memory.sqlite3",
     "__pycache__/*",
     "*.pyc",
     "*.pyo",
     "*.pyd",
+    "*.sqlite3",
     ".venv/*",
     "venv/*",
     "*.log",
