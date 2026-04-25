@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -68,11 +69,121 @@ SYSTEM_INSTRUCTION = (
     "Учитывай недавнюю историю диалога. "
     "Если пользователь пишет короткое уточнение вроде 'ну?', 'продолжай', 'реши их', "
     "связывай его с предыдущим контекстом, а не отвечай как на новый независимый вопрос. "
+    "Если пользователь явно начал новую самостоятельную тему, не тащи в ответ прошлую задачу, прошлое фото и старый контекст. "
     "Если пользователь уже присылал изображение и потом даёт текстовое уточнение в контексте фото, "
     "считай, что он имеет в виду последнее изображение. "
     "Если ответ получается длинным, сначала дай полезную суть, потом детали. "
     "Отвечай на русском языке, если пользователь не просит иное."
 )
+
+WORD_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9]+")
+
+STOP_WORDS = {
+    "и", "в", "во", "на", "по", "с", "со", "к", "ко", "у", "о", "об", "от", "за", "из",
+    "под", "над", "до", "для", "при", "не", "ни", "а", "но", "или", "ли", "же", "бы",
+    "это", "этот", "эта", "эти", "то", "та", "те", "так", "как", "что", "чтобы", "если",
+    "уже", "ещё", "еще", "там", "тут", "здесь", "меня", "мне", "мой", "моя", "мои", "мое",
+    "твой", "твоя", "твои", "тебе", "его", "ее", "её", "их", "они", "она", "оно", "он",
+    "мы", "вы", "ты", "я", "ну", "да", "нет", "просто", "надо", "нужно", "можно", "давай",
+}
+
+CONTINUATION_PHRASES = {
+    "ну", "ну?", "продолжай", "продолжи", "дальше", "еще", "ещё", "что дальше",
+    "реши", "реши их", "решай", "ответь", "объясни", "поясни", "распиши",
+    "расскажи подробнее", "подробнее", "что там", "и что", "и дальше",
+    "как меня зовут", "что я говорил", "что было раньше", "повтори",
+    "сделай короче", "сделай кратко", "продолжай решение",
+}
+
+PHOTO_CONTINUATION_PHRASES = {
+    "реши", "реши их", "что на фото", "прочитай", "разбери", "объясни задание",
+    "ответь по фото", "решай дальше", "дочитай", "что тут написано",
+}
+
+COMMON_WORD_ENDINGS = (
+    "иями", "ями", "ами", "его", "ого", "ему", "ому", "иях", "ах", "ях",
+    "ией", "ей", "ий", "ый", "ой", "ая", "яя", "ое", "ее", "ые", "ие",
+    "ую", "юю", "ам", "ям", "ом", "ем", "ов", "ев", "а", "я", "ы", "и", "е", "у", "ю", "о",
+)
+
+
+@dataclass
+class PromptRoutingDecision:
+    reset_context: bool
+    use_image_context: bool
+
+
+def normalize_prompt(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def extract_keywords(text: str) -> set[str]:
+    words = {
+        match.group(0).lower()
+        for match in WORD_RE.finditer(text or "")
+    }
+    return {
+        stem_word(word)
+        for word in words
+        if len(word) >= 3 and word not in STOP_WORDS
+    }
+
+
+def stem_word(word: str) -> str:
+    normalized = word.lower()
+    for ending in COMMON_WORD_ENDINGS:
+        if len(normalized) > len(ending) + 3 and normalized.endswith(ending):
+            return normalized[: -len(ending)]
+    return normalized
+
+
+def contains_any_phrase(text: str, phrases: set[str]) -> bool:
+    normalized = normalize_prompt(text)
+    return any(phrase in normalized for phrase in phrases)
+
+
+def is_short_followup(text: str) -> bool:
+    normalized = normalize_prompt(text)
+    return len(normalized) <= 40 or len(extract_keywords(normalized)) <= 2
+
+
+def recent_topic_overlap(prompt: str, recent_texts: list[str]) -> float:
+    prompt_keywords = extract_keywords(prompt)
+    recent_keywords = extract_keywords(" ".join(recent_texts))
+
+    if not prompt_keywords or not recent_keywords:
+        return 0.0
+
+    shared = prompt_keywords & recent_keywords
+    return len(shared) / max(1, len(prompt_keywords))
+
+
+def decide_prompt_routing(prompt: str, recent_texts: list[str], has_image_context: bool) -> PromptRoutingDecision:
+    normalized = normalize_prompt(prompt)
+
+    if not normalized:
+        return PromptRoutingDecision(reset_context=False, use_image_context=False)
+
+    if contains_any_phrase(normalized, CONTINUATION_PHRASES):
+        return PromptRoutingDecision(
+            reset_context=False,
+            use_image_context=has_image_context and contains_any_phrase(normalized, PHOTO_CONTINUATION_PHRASES),
+        )
+
+    overlap = recent_topic_overlap(normalized, recent_texts)
+    standalone_prompt = len(normalized) >= 20 or len(extract_keywords(normalized)) >= 3
+    clear_topic_shift = standalone_prompt and overlap < 0.2
+
+    if clear_topic_shift:
+        return PromptRoutingDecision(reset_context=True, use_image_context=False)
+
+    if has_image_context and contains_any_phrase(normalized, PHOTO_CONTINUATION_PHRASES):
+        return PromptRoutingDecision(reset_context=False, use_image_context=True)
+
+    if has_image_context and is_short_followup(normalized) and overlap >= 0.2:
+        return PromptRoutingDecision(reset_context=False, use_image_context=True)
+
+    return PromptRoutingDecision(reset_context=False, use_image_context=False)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,6 +305,25 @@ class ConversationMemory:
 
     async def get_contents(self, chat_id: int) -> list[types.Content]:
         return await asyncio.to_thread(self._get_contents_sync, chat_id)
+
+    def _get_recent_texts_sync(self, chat_id: int, limit: int) -> list[str]:
+        with self._lock:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT content
+                    FROM conversation_messages
+                    WHERE chat_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (chat_id, limit),
+                ).fetchall()
+
+        return [row["content"] for row in reversed(rows)]
+
+    async def get_recent_texts(self, chat_id: int, limit: int = 6) -> list[str]:
+        return await asyncio.to_thread(self._get_recent_texts_sync, chat_id, limit)
 
     def _clear_chat_sync(self, chat_id: int) -> None:
         with self._lock:
@@ -615,10 +745,23 @@ async def text_message_handler(message: Message, state: FSMContext) -> None:
         return
 
     current_state = await state.get_state()
+    recent_texts = await conversation_memory.get_recent_texts(message.chat.id, limit=6)
+    image_context = image_context_store.get(message.chat.id)
+    routing = decide_prompt_routing(
+        prompt=prompt,
+        recent_texts=recent_texts,
+        has_image_context=image_context is not None,
+    )
 
     try:
-        if current_state == UserState.waiting_photo.state:
-            image_context = image_context_store.get(message.chat.id)
+        if routing.reset_context:
+            logger.info("Обнаружена новая тема chat_id=%s, сбрасываем старый контекст.", message.chat.id)
+            await conversation_memory.clear_chat(message.chat.id)
+            image_context_store.clear(message.chat.id)
+            await state.set_state(UserState.waiting_text)
+
+        elif current_state == UserState.waiting_photo.state and image_context is not None and routing.use_image_context:
+            logger.info("Используем последнее фото как контекст chat_id=%s.", message.chat.id)
             if image_context is not None:
                 await process_photo_prompt(
                     message=message,
