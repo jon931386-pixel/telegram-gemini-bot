@@ -2,13 +2,18 @@ import asyncio
 import hashlib
 import logging
 import os
+import sqlite3
+import threading
+import time
+from contextlib import suppress
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -38,6 +43,7 @@ WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
 WEB_SERVER_PORT = int(os.getenv("PORT", os.getenv("WEB_SERVER_PORT", "7860")))
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip() or "/telegram/webhook"
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", hashlib.sha256(BOT_TOKEN.encode()).hexdigest())
+MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3")
 
 MODEL_CANDIDATES = (
     "gemini-2.5-flash-lite",
@@ -45,10 +51,28 @@ MODEL_CANDIDATES = (
     "gemini-2.0-flash",
 )
 
-REQUEST_TIMEOUT_SECONDS = 45
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "90"))
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "12"))
+MAX_MEMORY_MESSAGE_CHARS = int(os.getenv("MAX_MEMORY_MESSAGE_CHARS", "2500"))
+IMAGE_CONTEXT_TTL_SECONDS = int(os.getenv("IMAGE_CONTEXT_TTL_SECONDS", "3600"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1400"))
+TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_SAFE_CHUNK_SIZE = 3800
 
 TEXT_MODE_BUTTON = "💬 Текстовый запрос"
 PHOTO_MODE_BUTTON = "🖼 Фото запрос"
+
+SYSTEM_INSTRUCTION = (
+    "Ты дружелюбный русскоязычный помощник в Telegram. "
+    "Отвечай естественно и по делу, без фраз вроде 'я языковая модель', если пользователь об этом не спрашивал. "
+    "Учитывай недавнюю историю диалога. "
+    "Если пользователь пишет короткое уточнение вроде 'ну?', 'продолжай', 'реши их', "
+    "связывай его с предыдущим контекстом, а не отвечай как на новый независимый вопрос. "
+    "Если пользователь уже присылал изображение и потом даёт текстовое уточнение в контексте фото, "
+    "считай, что он имеет в виду последнее изображение. "
+    "Если ответ получается длинным, сначала дай полезную суть, потом детали. "
+    "Отвечай на русском языке, если пользователь не просит иное."
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +84,175 @@ logger = logging.getLogger("telegram_gemini_bot")
 class UserState(StatesGroup):
     waiting_text = State()
     waiting_photo = State()
+
+
+@dataclass
+class ImageContext:
+    image_bytes: bytes
+    mime_type: str
+    saved_at: float
+
+
+class ConversationMemory:
+    def __init__(self, db_path: str, max_messages: int, max_message_chars: int) -> None:
+        self.db_path = db_path
+        self.max_messages = max_messages
+        self.max_message_chars = max_message_chars
+        self._lock = threading.Lock()
+        self._ensure_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _ensure_db(self) -> None:
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS conversation_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id INTEGER NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_conversation_messages_chat_id_id
+                    ON conversation_messages (chat_id, id)
+                    """
+                )
+
+    def _clip_for_memory(self, text: str) -> str:
+        cleaned = (text or "").strip()
+        if len(cleaned) <= self.max_message_chars:
+            return cleaned
+        return cleaned[: self.max_message_chars].rstrip() + "\n\n[Обрезано для памяти]"
+
+    def _prune(self, connection: sqlite3.Connection, chat_id: int) -> None:
+        rows = connection.execute(
+            """
+            SELECT id
+            FROM conversation_messages
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            """,
+            (chat_id,),
+        ).fetchall()
+
+        stale_rows = rows[self.max_messages :]
+        if stale_rows:
+            connection.executemany(
+                "DELETE FROM conversation_messages WHERE id = ?",
+                [(row["id"],) for row in stale_rows],
+            )
+
+    def _add_exchange_sync(self, chat_id: int, user_text: str, assistant_text: str) -> None:
+        clipped_user = self._clip_for_memory(user_text)
+        clipped_assistant = self._clip_for_memory(assistant_text)
+
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO conversation_messages (chat_id, role, content) VALUES (?, ?, ?)",
+                    (chat_id, "user", clipped_user),
+                )
+                connection.execute(
+                    "INSERT INTO conversation_messages (chat_id, role, content) VALUES (?, ?, ?)",
+                    (chat_id, "assistant", clipped_assistant),
+                )
+                self._prune(connection, chat_id)
+
+    async def add_exchange(self, chat_id: int, user_text: str, assistant_text: str) -> None:
+        await asyncio.to_thread(self._add_exchange_sync, chat_id, user_text, assistant_text)
+
+    def _get_contents_sync(self, chat_id: int) -> list[types.Content]:
+        with self._lock:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT role, content
+                    FROM conversation_messages
+                    WHERE chat_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (chat_id,),
+                ).fetchall()
+
+        contents: list[types.Content] = []
+        for row in rows:
+            part = types.Part(text=row["content"])
+            if row["role"] == "assistant":
+                contents.append(types.ModelContent(parts=[part]))
+            else:
+                contents.append(types.UserContent(parts=[part]))
+        return contents
+
+    async def get_contents(self, chat_id: int) -> list[types.Content]:
+        return await asyncio.to_thread(self._get_contents_sync, chat_id)
+
+    def _clear_chat_sync(self, chat_id: int) -> None:
+        with self._lock:
+            with self._connect() as connection:
+                connection.execute("DELETE FROM conversation_messages WHERE chat_id = ?", (chat_id,))
+
+    async def clear_chat(self, chat_id: int) -> None:
+        await asyncio.to_thread(self._clear_chat_sync, chat_id)
+
+
+class ImageSessionStore:
+    def __init__(self, ttl_seconds: int) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._items: dict[int, ImageContext] = {}
+
+    def remember(self, chat_id: int, image_bytes: bytes, mime_type: str) -> None:
+        self._items[chat_id] = ImageContext(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            saved_at=time.time(),
+        )
+
+    def get(self, chat_id: int) -> ImageContext | None:
+        context = self._items.get(chat_id)
+        if context is None:
+            return None
+
+        if time.time() - context.saved_at > self.ttl_seconds:
+            self._items.pop(chat_id, None)
+            return None
+
+        return context
+
+    def clear(self, chat_id: int) -> None:
+        self._items.pop(chat_id, None)
+
+
+class RepeatingChatAction:
+    def __init__(self, bot: Bot, chat_id: int, action: ChatAction = ChatAction.TYPING, interval: float = 4.0) -> None:
+        self.bot = bot
+        self.chat_id = chat_id
+        self.action = action
+        self.interval = interval
+        self._task: asyncio.Task[None] | None = None
+
+    async def _run(self) -> None:
+        while True:
+            await self.bot.send_chat_action(self.chat_id, self.action)
+            await asyncio.sleep(self.interval)
+
+    async def __aenter__(self) -> None:
+        self._task = asyncio.create_task(self._run())
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -75,32 +268,101 @@ def main_menu() -> ReplyKeyboardMarkup:
     )
 
 
+def split_text_for_telegram(text: str, chunk_size: int = TELEGRAM_SAFE_CHUNK_SIZE) -> list[str]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return ["Не удалось сформировать ответ."]
+
+    chunks: list[str] = []
+    remaining = normalized
+
+    while len(remaining) > TELEGRAM_TEXT_LIMIT:
+        split_at = remaining.rfind("\n\n", 0, chunk_size)
+        if split_at < chunk_size // 2:
+            split_at = remaining.rfind("\n", 0, chunk_size)
+        if split_at < chunk_size // 2:
+            split_at = remaining.rfind(". ", 0, chunk_size)
+        if split_at < chunk_size // 2:
+            split_at = remaining.rfind(" ", 0, chunk_size)
+        if split_at <= 0:
+            split_at = chunk_size
+
+        chunk = remaining[:split_at].strip()
+        if not chunk:
+            chunk = remaining[:chunk_size]
+            split_at = chunk_size
+
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
+
+async def answer_in_chunks(message: Message, text: str) -> None:
+    for chunk in split_text_for_telegram(text):
+        await message.answer(chunk)
+
+
 class GeminiService:
-    def __init__(self, api_key: str, models: tuple[str, ...], timeout_seconds: int = 45) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        models: tuple[str, ...],
+        memory: ConversationMemory,
+        timeout_seconds: int = 90,
+        max_output_tokens: int = 1400,
+    ) -> None:
         self.client = genai.Client(api_key=api_key)
         self.models = models
+        self.memory = memory
         self.timeout_seconds = timeout_seconds
+        self.generation_config = types.GenerateContentConfig(
+            systemInstruction=SYSTEM_INSTRUCTION,
+            temperature=0.7,
+            maxOutputTokens=max_output_tokens,
+        )
 
-    async def ask_text(self, prompt: str) -> str:
+    async def ask_text(self, chat_id: int, prompt: str) -> str:
         prompt = (prompt or "").strip()
         if not prompt:
             return "Пустой запрос. Напиши текст."
-        return await self._generate(prompt)
 
-    async def ask_image(self, image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
+        logger.info("Текстовый запрос chat_id=%s chars=%s", chat_id, len(prompt))
+        contents = await self.memory.get_contents(chat_id)
+        contents.append(types.UserContent(parts=[types.Part(text=prompt)]))
+
+        reply = await self._generate(contents)
+        await self.memory.add_exchange(chat_id, prompt, reply)
+        return reply
+
+    async def ask_image(self, chat_id: int, image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
         if not image_bytes:
             return "Не удалось прочитать изображение."
 
-        contents: list[Any] = [
-            types.Part.from_bytes(
-                data=image_bytes,
-                mime_type=mime_type,
-            ),
-            (prompt or "").strip() or "Что на фото? Ответь на русском.",
-        ]
-        return await self._generate(contents)
+        prompt = (prompt or "").strip() or "Что на фото? Ответь на русском."
+        logger.info("Фото-запрос chat_id=%s prompt_chars=%s image_bytes=%s", chat_id, len(prompt), len(image_bytes))
 
-    async def _generate(self, contents: Any) -> str:
+        contents = await self.memory.get_contents(chat_id)
+        contents.append(
+            types.UserContent(
+                parts=[
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type=mime_type,
+                    ),
+                    types.Part(text=prompt),
+                ]
+            )
+        )
+
+        reply = await self._generate(contents)
+        await self.memory.add_exchange(chat_id, f"[Фото] {prompt}", reply)
+        return reply
+
+    async def _generate(self, contents: list[types.Content]) -> str:
         last_error: Exception | None = None
 
         for model_name in self.models:
@@ -112,6 +374,7 @@ class GeminiService:
                         self.client.models.generate_content,
                         model=model_name,
                         contents=contents,
+                        config=self.generation_config,
                     ),
                     timeout=self.timeout_seconds,
                 )
@@ -131,9 +394,17 @@ class GeminiService:
                 break
 
         logger.error("Все модели недоступны. Последняя ошибка: %r", last_error)
+
+        error_message = str(last_error or "").lower()
+        if "timeout" in error_message or "deadline exceeded" in error_message:
+            return (
+                "Ответ готовился слишком долго и запрос оборвался по времени. "
+                "Попробуй сократить запрос или разбить его на части."
+            )
+
         return (
-            "Все модели недоступны.\n"
-            "Проверь API-ключ, доступность модели и квоту."
+            "Сейчас не получилось получить ответ от модели. "
+            "Попробуй ещё раз через несколько секунд."
         )
 
     @staticmethod
@@ -171,8 +442,8 @@ class GeminiService:
             "resource exhausted",
             "temporarily unavailable",
             "service unavailable",
-            "timeout",
-            "deadline exceeded",
+            "internal",
+            "unavailable",
             "404",
             "not found",
             "model",
@@ -180,10 +451,19 @@ class GeminiService:
         return any(marker in msg for marker in retryable)
 
 
+conversation_memory = ConversationMemory(
+    db_path=MEMORY_DB_PATH,
+    max_messages=MAX_HISTORY_MESSAGES,
+    max_message_chars=MAX_MEMORY_MESSAGE_CHARS,
+)
+image_context_store = ImageSessionStore(ttl_seconds=IMAGE_CONTEXT_TTL_SECONDS)
+
 gemini_service = GeminiService(
     api_key=GEMINI_API_KEY,
     models=MODEL_CANDIDATES,
+    memory=conversation_memory,
     timeout_seconds=REQUEST_TIMEOUT_SECONDS,
+    max_output_tokens=MAX_OUTPUT_TOKENS,
 )
 
 bot = Bot(token=BOT_TOKEN)
@@ -230,49 +510,79 @@ async def disable_webhook_for_polling() -> None:
         logger.warning("Не удалось отключить webhook перед polling: %s", exc)
 
 
+async def process_text_prompt(message: Message, state: FSMContext, prompt: str) -> None:
+    await state.set_state(UserState.waiting_text)
+    async with RepeatingChatAction(message.bot, message.chat.id):
+        reply = await gemini_service.ask_text(chat_id=message.chat.id, prompt=prompt)
+    await answer_in_chunks(message, reply)
+
+
+async def process_photo_prompt(
+    message: Message,
+    state: FSMContext,
+    prompt: str,
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+) -> None:
+    await state.set_state(UserState.waiting_photo)
+    async with RepeatingChatAction(message.bot, message.chat.id):
+        reply = await gemini_service.ask_image(
+            chat_id=message.chat.id,
+            image_bytes=image_bytes,
+            prompt=prompt,
+            mime_type=mime_type,
+        )
+    await answer_in_chunks(message, reply)
+
+
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Привет! Выбери режим:", reply_markup=main_menu())
+    await message.answer(
+        "Привет! Можешь писать текстом или присылать фото. "
+        "Кнопки ниже просто помогают переключать режимы. "
+        "Чтобы очистить память диалога, используй /new.",
+        reply_markup=main_menu(),
+    )
 
 
 @dp.message(Command("cancel"))
 async def cancel_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Отменено. Выбери режим:", reply_markup=main_menu())
+    await message.answer(
+        "Режим сброшен. Память диалога сохранена. "
+        "Если хочешь начать с нуля, используй /new.",
+        reply_markup=main_menu(),
+    )
+
+
+@dp.message(Command(commands=["new", "reset", "clear"]))
+async def new_dialog_handler(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await conversation_memory.clear_chat(message.chat.id)
+    image_context_store.clear(message.chat.id)
+    await message.answer(
+        "Память диалога очищена. Начинаем заново.",
+        reply_markup=main_menu(),
+    )
 
 
 @dp.message(F.text == TEXT_MODE_BUTTON)
 async def text_mode_handler(message: Message, state: FSMContext) -> None:
     await state.set_state(UserState.waiting_text)
-    await message.answer("Напиши свой вопрос.")
+    await message.answer("Текстовый режим включён. Напиши свой вопрос.")
 
 
 @dp.message(F.text == PHOTO_MODE_BUTTON)
 async def photo_mode_handler(message: Message, state: FSMContext) -> None:
     await state.set_state(UserState.waiting_photo)
-    await message.answer("Пришли фото, можно с подписью.")
+    await message.answer(
+        "Фото-режим включён. Пришли фото или уточнение по последнему фото."
+    )
 
 
-@dp.message(StateFilter(UserState.waiting_text), F.text)
-async def process_text_handler(message: Message) -> None:
-    if not message.text or message.text in {TEXT_MODE_BUTTON, PHOTO_MODE_BUTTON}:
-        return
-
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    reply = await gemini_service.ask_text(message.text)
-    await message.answer(reply)
-
-
-@dp.message(StateFilter(UserState.waiting_text))
-async def process_wrong_text_input(message: Message) -> None:
-    await message.answer("Сейчас активен текстовый режим. Напиши сообщение текстом.")
-
-
-@dp.message(StateFilter(UserState.waiting_photo), F.photo)
-async def process_photo_handler(message: Message) -> None:
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
+@dp.message(F.photo)
+async def photo_message_handler(message: Message, state: FSMContext) -> None:
     try:
         photo = message.photo[-1]
         file_buffer = await message.bot.download(photo)
@@ -282,34 +592,58 @@ async def process_photo_handler(message: Message) -> None:
             return
 
         image_bytes = file_buffer.getvalue()
-        caption = (message.caption or "").strip() or "Что на фото? Ответь на русском."
+        image_context_store.remember(message.chat.id, image_bytes, "image/jpeg")
 
-        reply = await gemini_service.ask_image(
+        prompt = (message.caption or "").strip() or "Что на фото? Ответь на русском."
+        await process_photo_prompt(
+            message=message,
+            state=state,
+            prompt=prompt,
             image_bytes=image_bytes,
-            prompt=caption,
             mime_type="image/jpeg",
         )
-        await message.answer(reply)
-
     except Exception as exc:
         logger.exception("Ошибка обработки фото: %s", exc)
         await message.answer("Ошибка при обработке фото. Попробуй ещё раз.")
 
 
-@dp.message(StateFilter(UserState.waiting_photo))
-async def process_wrong_photo_input(message: Message) -> None:
-    await message.answer("Сейчас активен режим фото. Пришли изображение.")
+@dp.message(F.text)
+async def text_message_handler(message: Message, state: FSMContext) -> None:
+    prompt = (message.text or "").strip()
+    if not prompt:
+        await message.answer("Напиши текстовый запрос или пришли фото.")
+        return
+
+    current_state = await state.get_state()
+
+    try:
+        if current_state == UserState.waiting_photo.state:
+            image_context = image_context_store.get(message.chat.id)
+            if image_context is not None:
+                await process_photo_prompt(
+                    message=message,
+                    state=state,
+                    prompt=prompt,
+                    image_bytes=image_context.image_bytes,
+                    mime_type=image_context.mime_type,
+                )
+                return
+
+        await process_text_prompt(message=message, state=state, prompt=prompt)
+    except Exception as exc:
+        logger.exception("Ошибка обработки текстового запроса: %s", exc)
+        await message.answer(
+            "Не получилось отправить ответ. Попробуй ещё раз, "
+            "а если запрос очень большой — разбей его на части."
+        )
 
 
 @dp.message()
-async def fallback_handler(message: Message, state: FSMContext) -> None:
-    current_state = await state.get_state()
-
-    if current_state is None:
-        await message.answer("Выбери режим:", reply_markup=main_menu())
-        return
-
-    await message.answer("Не понял запрос. Используй кнопки или /cancel.")
+async def fallback_handler(message: Message) -> None:
+    await message.answer(
+        "Я понимаю текст и фото. Напиши сообщение или пришли изображение.",
+        reply_markup=main_menu(),
+    )
 
 
 async def healthcheck(_: web.Request) -> web.Response:
